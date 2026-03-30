@@ -13,6 +13,11 @@ import sys
 # Append src to path
 sys.path.append(os.getcwd())
 from src.segmentation import segment_jewelry
+try:
+    from predict_patchcore import PatchCorePredictor
+except ImportError:
+    PatchCorePredictor = None
+
 
 class DefectDetectionApp:
     def __init__(self, root):
@@ -28,14 +33,23 @@ class DefectDetectionApp:
         self.model_loaded = False
         self.is_blinking = False
         self.blink_state = False
-        self.threshold = 15.0 # DINO threshold based on report
+        
+        # --- THRESHOLD SETTINGS ---
+        self.dino_threshold = 15.0       # Lower this if DINO misses defects
+        self.patchcore_threshold = 6  # Lower this if PatchCore misses defects
+        
+        # Current active threshold
+        self.threshold = self.dino_threshold 
+        
+        self.dino_model = None
+        self.patchcore_model = None
         
         # UI Layout
         self._setup_ui()
         
-        # Load Model in background
+        # Default start loading DINO
         self.status_label.config(text="Loading Model (DINOv2)... Please Wait")
-        threading.Thread(target=self._load_model, daemon=True).start()
+        threading.Thread(target=self._load_dino, daemon=True).start()
 
     def _setup_ui(self):
         # Top Bar
@@ -45,11 +59,17 @@ class DefectDetectionApp:
         tk.Button(top_frame, text="Load Image", command=self.load_image, 
                   bg="#2980b9", fg="white", font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=20, pady=10)
         
+        # Model Selection
+        self.model_var = tk.StringVar(value="DINOv2")
+        models = ["DINOv2", "PatchCore"]
+        tk.OptionMenu(top_frame, self.model_var, *models, command=self._on_model_change).pack(side=tk.LEFT, padx=20, pady=10)
+        
         tk.Button(top_frame, text="Run Detection", command=self.run_detection, 
                   bg="#e67e22", fg="white", font=("Arial", 12, "bold")).pack(side=tk.LEFT, padx=20, pady=10)
 
         self.status_label = tk.Label(top_frame, text="Ready", bg="#34495e", fg="#ecf0f1", font=("Arial", 14))
         self.status_label.pack(side=tk.RIGHT, padx=20)
+
 
         # Main Content (Split View)
         content_frame = tk.Frame(self.root, bg="#2c3e50")
@@ -71,7 +91,26 @@ class DefectDetectionApp:
                                   bg="gray", fg="white", font=("Arial", 24, "bold"), width=20, height=2)
         self.indicator.pack()
 
-    def _load_model(self):
+    def _on_model_change(self, model_name):
+        if model_name == "DINOv2":
+            if self.dino_model is None:
+                self.status_label.config(text="Loading DINOv2... Please Wait")
+                threading.Thread(target=self._load_dino, daemon=True).start()
+            else:
+                self.threshold = self.dino_threshold
+                self.status_label.config(text="Model: DINOv2 Ready")
+        elif model_name == "PatchCore":
+            if PatchCorePredictor is None:
+                messagebox.showerror("Error", "Could not import PatchCorePredictor")
+                return
+            if self.patchcore_model is None:
+                self.status_label.config(text="Loading PatchCore... Please Wait")
+                threading.Thread(target=self._load_patchcore, daemon=True).start()
+            else:
+                self.threshold = self.patchcore_threshold
+                self.status_label.config(text="Model: PatchCore Ready")
+
+    def _load_dino(self):
         try:
             print("Loading DINOv2...")
             self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
@@ -82,11 +121,26 @@ class DefectDetectionApp:
                 data = pickle.load(f)
                 self.nbrs = data['nbrs']
                 
-            self.model_loaded = True
+            self.dino_model = True
+            self.current_model = "DINOv2"
+            self.threshold = self.dino_threshold
             self.root.after(0, lambda: self.status_label.config(text="Model Loaded (DINOv2) - Ready"))
             print("Model Loaded.")
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load model: {e}"))
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load DINOv2: {e}"))
+
+    def _load_patchcore(self):
+        try:
+            print("Loading PatchCore...")
+            self.patchcore_predictor = PatchCorePredictor("patchcore_resnet50.pkl")
+            self.patchcore_model = True
+            self.current_model = "PatchCore"
+            self.threshold = self.patchcore_threshold
+            self.root.after(0, lambda: self.status_label.config(text="Model Loaded (PatchCore) - Ready"))
+            print("Model Loaded.")
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load PatchCore: {e}"))
+
 
     def load_image(self):
         file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg;*.png;*.jpeg")])
@@ -112,18 +166,24 @@ class DefectDetectionApp:
         self._reset_indicator()
 
     def run_detection(self):
-        if not self.model_loaded:
-            messagebox.showwarning("Wait", "Model is still loading...")
-            return
+        selected_model = self.model_var.get()
+        if selected_model == "DINOv2" and self.dino_model is None:
+             messagebox.showwarning("Wait", "DINOv2 Model is not loaded.")
+             self._on_model_change("DINOv2")
+             return
+        if selected_model == "PatchCore" and self.patchcore_model is None:
+             messagebox.showwarning("Wait", "PatchCore Model is not loaded.")
+             self._on_model_change("PatchCore")
+             return
+
         if not hasattr(self, 'current_image_path'):
             messagebox.showwarning("Warning", "Load an image first.")
             return
 
-        self.status_label.config(text="Processing...")
+        self.status_label.config(text=f"Processing with {selected_model}...")
         self.root.update()
         
         try:
-            # Inference Logic (same as predict_dino.py)
             image = Image.open(self.current_image_path).convert('RGB')
             w, h = image.size
             
@@ -134,28 +194,43 @@ class DefectDetectionApp:
             _, mask_orig = segment_jewelry(image)
             if mask_orig.sum() == 0: mask_orig = np.ones((h, w), dtype=np.float32)
 
-            target_size = (252, 252)
-            transform = transforms.Compose([
-                transforms.Resize(target_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-            input_tensor = transform(image).unsqueeze(0).to(self.device)
+            # Different Logic per model
+            if selected_model == "DINOv2":
+                target_size = (252, 252)
+                transform = transforms.Compose([
+                    transforms.Resize(target_size),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+                input_tensor = transform(image).unsqueeze(0).to(self.device)
 
-            # --- Forward Pass ---
-            with torch.no_grad():
-                ret = self.backbone.forward_features(input_tensor)
-                patch_tokens = ret['x_norm_patchtokens']
+                # --- Forward Pass ---
+                with torch.no_grad():
+                    ret = self.backbone.forward_features(input_tensor)
+                    patch_tokens = ret['x_norm_patchtokens']
+                
+                features = patch_tokens[0].cpu().numpy()
+                distances, _ = self.nbrs.kneighbors(features)
+                
+                H_feat, W_feat = target_size[0] // 14, target_size[1] // 14
+                anomaly_map = distances.reshape(H_feat, W_feat)
+                
+                # Resize map to original image
+                anomaly_map_resized = cv2.resize(anomaly_map, (w, h), interpolation=cv2.INTER_LINEAR)
             
-            features = patch_tokens[0].cpu().numpy()
-            distances, _ = self.nbrs.kneighbors(features)
-            
-            H_feat, W_feat = target_size[0] // 14, target_size[1] // 14
-            anomaly_map = distances.reshape(H_feat, W_feat)
-            
-            # --- Post-Processing ---
-            # Resize map to original image
-            anomaly_map_resized = cv2.resize(anomaly_map, (w, h), interpolation=cv2.INTER_LINEAR)
+            elif selected_model == "PatchCore":
+                target_size = (256, 256) # ResNet usually 224 or 256
+                transform = transforms.Compose([
+                    transforms.Resize(target_size),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+                input_tensor = transform(image).unsqueeze(0) #.to(self.device) - PatchCore class handles device
+                
+                anomaly_map = self.patchcore_predictor.predict(input_tensor)
+                
+                # Resize map to original image
+                anomaly_map_resized = cv2.resize(anomaly_map, (w, h), interpolation=cv2.INTER_LINEAR)
             
             # Apply Mask
             if mask_orig.shape != anomaly_map_resized.shape:
@@ -165,6 +240,7 @@ class DefectDetectionApp:
             score = np.max(masked_map)
             
             is_defect = score > self.threshold
+
             
             # --- Visualization ---
             # Prepare Output Image (Resized for Display)
@@ -173,7 +249,12 @@ class DefectDetectionApp:
             output_pil = self.display_img_pil.copy()
             draw_img = np.array(output_pil)
             
+             # Calculate scale factors
+            scale_x = disp_w / w
+            scale_y = disp_h / h
+
             if is_defect:
+                print(f"Defect Detected! Score: {score}")
                 # Dynamic Thresholding for Precision
                 # We want to highlight only the "peak" anomalies (the actual defect), 
                 # not the general noise of the chain.
@@ -188,10 +269,6 @@ class DefectDetectionApp:
                 defect_mask = cv2.morphologyEx(defect_mask, cv2.MORPH_CLOSE, kernel)
                 
                 contours, _ = cv2.findContours(defect_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # We need to map coordinates from Original (w,h) to Display (disp_w, disp_h)
-                scale_x = disp_w / w
-                scale_y = disp_h / h
                 
                 box_count = 0
                 for cnt in contours:
@@ -229,21 +306,23 @@ class DefectDetectionApp:
                      cv2.line(draw_img, (dmx-10, dmy), (dmx+10, dmy), (255, 0, 0), 2)
                      cv2.line(draw_img, (dmx, dmy-10), (dmx, dmy+10), (255, 0, 0), 2)
                      cv2.putText(draw_img, f"MAX: {score:.1f}", (dmx+25, dmy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                
-                # Fallback: If score says defect but no contours found (e.g. single pixel spike),
-                # Draw circle at max point
-                if box_count == 0:
-                     minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(masked_map)
-                     mx, my = maxLoc
-                     
-                     dmx = int(mx * scale_x)
-                     dmy = int(my * scale_y)
-                     
-                     # Draw Crosshair
-                     cv2.circle(draw_img, (dmx, dmy), 20, (255, 0, 0), 3)
-                     cv2.line(draw_img, (dmx-10, dmy), (dmx+10, dmy), (255, 0, 0), 2)
-                     cv2.line(draw_img, (dmx, dmy-10), (dmx, dmy+10), (255, 0, 0), 2)
-                     cv2.putText(draw_img, f"MAX: {score:.1f}", (dmx+25, dmy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            else:
+                 print(f"No Defect Detected. Score: {score}")
+                 # Draw Green Border/Text for OK
+                 cv2.rectangle(draw_img, (0, 0), (disp_w-1, disp_h-1), (0, 255, 0), 5)
+                 cv2.putText(draw_img, f"OK - Score: {score:.2f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                 
+                 # Optional: Show where the max score was, even if low
+                 minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(masked_map)
+                 mx, my = maxLoc
+                 
+                 dmx = int(mx * scale_x)
+                 dmy = int(my * scale_y)
+                 
+                 # Draw Crosshair (Green for OK)
+                 cv2.circle(draw_img, (dmx, dmy), 10, (0, 255, 0), 2)
+                 cv2.line(draw_img, (dmx-5, dmy), (dmx+5, dmy), (0, 255, 0), 1)
+                 cv2.line(draw_img, (dmx, dmy-5), (dmx, dmy+5), (0, 255, 0), 1)
             
             # Update Output Panel
             self.output_tk = ImageTk.PhotoImage(Image.fromarray(draw_img))
